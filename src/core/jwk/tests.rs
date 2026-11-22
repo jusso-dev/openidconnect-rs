@@ -13,9 +13,8 @@ use crate::{JsonWebKey, JsonWebKeyId, JsonWebTokenAlgorithm, PrivateSigningKey, 
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use rand::rngs::mock::StepRng;
-use rand::{CryptoRng, RngCore};
-use rsa::rand_core;
+use rand::{TryCryptoRng, TryRng};
+use std::convert::Infallible;
 
 #[test]
 fn test_core_jwk_deserialization_rsa() {
@@ -493,6 +492,39 @@ fn test_rsa_pkcs1_verification() {
     );
 }
 
+/// RFC 7518 section 6.3.1.1 says `n` has no leading zero bytes, but some
+/// providers send one. The modulus is parsed as a big-endian integer, so the
+/// padded key still verifies.
+#[test]
+fn test_rsa_verification_with_zero_padded_modulus() {
+    let key: CoreJsonWebKey =
+        serde_json::from_str(TEST_RSA_PUB_KEY).expect("deserialization failed");
+    let mut n = key.n.as_ref().expect("n").to_vec();
+    n.insert(0, 0);
+    let padded = CoreJsonWebKey {
+        n: Some(crate::helpers::Base64UrlEncodedBytes::new(n)),
+        ..key
+    };
+
+    // Source: https://tools.ietf.org/html/rfc7520#section-4.1
+    verify_signature(
+        &padded,
+        &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6ImJpbGJvLmJhZ2dpbnNAaG9iYml0b24uZX\
+         hhbXBsZSJ9.\
+         SXTigJlzIGEgZGFuZ2Vyb3VzIGJ1c2luZXNzLCBGcm9kbywgZ29pbmcgb3V0IH\
+         lvdXIgZG9vci4gWW91IHN0ZXAgb250byB0aGUgcm9hZCwgYW5kIGlmIHlvdSBk\
+         b24ndCBrZWVwIHlvdXIgZmVldCwgdGhlcmXigJlzIG5vIGtub3dpbmcgd2hlcm\
+         UgeW91IG1pZ2h0IGJlIHN3ZXB0IG9mZiB0by4",
+        "MRjdkly7_-oTPTS3AXP41iQIGKa80A0ZmTuV5MEaHoxnW2e5CZ5NlKtainoFmK\
+         ZopdHM1O2U4mwzJdQx996ivp83xuglII7PNDi84wnB-BDkoBwA78185hX-Es4J\
+         IwmDLJK3lfWRa-XtL0RnltuYv746iYTh_qHRD68BNt1uSNCrUCTJDt5aAE6x8w\
+         W1Kt9eRo4QPocSadnHXFxnt8Is9UzpERV0ePPQdLuW3IS_de3xyIrDaLGdjluP\
+         xUAhb6L2aXic1U12podGU0KLUQSE_oI-ZnmKJ3F4uOZDnd6QZWJushZ41Axf_f\
+         cIe8u9ipH84ogoree7vjbU5y18kDquDg",
+    );
+}
+
 #[test]
 fn test_rsa_pss_verification() {
     let key: CoreJsonWebKey =
@@ -730,24 +762,37 @@ fn expect_rsa_sig(
     public_key.verify_signature(alg, message, &sig).unwrap();
 }
 
+/// Yields the same `u64` forever, so PSS signatures in these tests are
+/// deterministic. Matches the bytes `rand` 0.8's `StepRng::new(value, 0)` gave
+/// (little-endian words), which `rand` 0.10 no longer provides.
 #[derive(Clone)]
-struct TestRng(StepRng);
+struct TestRng(u64);
 
-impl CryptoRng for TestRng {}
-impl RngCore for TestRng {
-    fn next_u32(&mut self) -> u32 {
-        self.0.next_u32()
+impl TryRng for TestRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok(self.0 as u32)
     }
-    fn next_u64(&mut self) -> u64 {
-        self.0.next_u64()
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        Ok(self.0)
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.fill_bytes(dest)
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.0.try_fill_bytes(dest)
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Infallible> {
+        let mut chunks = dest.chunks_exact_mut(8);
+        for chunk in &mut chunks {
+            chunk.copy_from_slice(&self.0.to_le_bytes());
+        }
+        let rest = chunks.into_remainder();
+        let n = rest.len();
+        if n > 4 {
+            rest.copy_from_slice(&self.0.to_le_bytes()[..n]);
+        } else if n > 0 {
+            rest.copy_from_slice(&(self.0 as u32).to_le_bytes()[..n]);
+        }
+        Ok(())
     }
 }
+impl TryCryptoRng for TestRng {}
 
 #[test]
 fn test_ed_signing() {
@@ -795,7 +840,7 @@ fn test_rsa_signing() {
     let private_key = CoreRsaPrivateSigningKey::from_pem_internal(
         TEST_RSA_KEY,
         // Constant salt used for PSS test vectors below.
-        Box::new(TestRng(StepRng::new(127, 0))),
+        Box::new(TestRng(127)),
         Some(JsonWebKeyId::new("test_key".to_string())),
     )
     .unwrap();
